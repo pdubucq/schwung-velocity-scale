@@ -17,7 +17,7 @@ docker run --rm -v "$PWD":/build -w /build "$IMAGE" \
     aarch64-linux-gnu-gcc -g -O3 -shared -fPIC \
         src/dsp/velocity_scale.c \
         -o /build/dsp.so \
-        -Isrc/host -lm
+        -Isrc -lm
 
 echo "==> packaging dist/"
 rm -rf dist && mkdir -p "dist/$ID"
