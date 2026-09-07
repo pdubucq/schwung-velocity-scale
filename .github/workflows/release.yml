@@ -2,6 +2,9 @@ name: release
 on:
   push:
     tags: ['v*']
+permissions:
+  contents: write   # the release step creates the GitHub release
+
 jobs:
   build:
     runs-on: ubuntu-latest
