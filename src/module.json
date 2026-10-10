@@ -12,6 +12,26 @@
           "name": "Velocity Scale",
           "params": [
             {
+              "key": "input_min",
+              "short_name": "In Min",
+              "name": "Input Min",
+              "type": "int",
+              "min": 1,
+              "max": 127,
+              "default": 1,
+              "step": 1
+            },
+            {
+              "key": "input_max",
+              "short_name": "In Max",
+              "name": "Input Max",
+              "type": "int",
+              "min": 1,
+              "max": 127,
+              "default": 127,
+              "step": 1
+            },
+            {
               "key": "min",
               "short_name": "Min",
               "name": "Min",
@@ -59,7 +79,9 @@
           "knobs": [
             "min",
             "max",
-            "curve"
+            "curve",
+            "input_min",
+            "input_max"
           ]
         }
       }

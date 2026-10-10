@@ -1,9 +1,10 @@
 /*
  * Velocity Scale MIDI FX
  *
- * Shapes incoming note velocities in two additive stages:
- *   1. MPC Curve  - a tunable power curve (off by default, Curve=0 = linear).
- *   2. Min/Max    - linear scale of the curve output into a configurable range.
+ * Shapes incoming note velocities in three stages:
+ *   1. Input Rescale - maps a custom physical input range (input_min..input_max) to 0..1.
+ *   2. MPC Curve     - a tunable power curve applied to the normalized input.
+ *   3. Min/Max       - linear scale of the curve output into a configurable output range.
  * Velocity 0 (note-off) is always passed through unchanged.
  */
 
@@ -30,9 +31,11 @@ static int json_get_int(const char *json, const char *key, int *out) {
 }
 
 typedef struct {
-    int vel_min;  /* 1-127 */
-    int vel_max;  /* 1-127 */
-    int curve;    /* -100..+100, 0 = linear (no-op) */
+    int input_min; /* 1-127 */
+    int input_max; /* 1-127 */
+    int vel_min;   /* 1-127 */
+    int vel_max;   /* 1-127 */
+    int curve;     /* -100..+100, 0 = linear (no-op) */
 } velocity_scale_instance_t;
 
 static const host_api_v1_t *g_host = NULL;
@@ -48,30 +51,8 @@ static const curve_preset_t CURVE_PRESETS[] = {
 };
 #define NUM_CURVE_PRESETS ((int)(sizeof(CURVE_PRESETS) / sizeof(CURVE_PRESETS[0])))
 
-/*
- * MPC Curve velocity shaping
- * --------------------------
- * Applies a tunable power curve to note-on velocity. Approximates the feel of
- * an Akai MPC pad/velocity curve; the MPC's exact internal transfer function is
- * unpublished, so this is a continuous, monotonic power curve.
- *
- * Sign convention (Curve in -100..+100, 0 = linear / no change):
- *   Positive Curve = more sensitive / easier to play loud (boosts soft hits).
- *   Negative Curve = harder; requires harder hits to reach high velocity.
- *
- * For a note-on velocity v (1..127):
- *   n      = (v - 1) / 126.0                 // v=1 -> 0, v=127 -> 1
- *   gamma  = pow(2.0, -Curve / 100.0 * 2.0)  // 0 -> 1, +100 -> 0.25, -100 -> 4.0
- *   shaped = pow(n, gamma)
- *   out    = 1 + shaped * 126.0
- * Endpoints are exact for any Curve: v=1 -> 1 and v=127 -> 127.
- */
-static double curve_stage(double v, int curve) {
-    if (curve == 0) return v;  /* linear: exact no-op */
-    double n = (v - 1.0) / 126.0;
-    double gamma = pow(2.0, -curve / 100.0 * 2.0);
-    double shaped = pow(n, gamma);
-    return 1.0 + shaped * 126.0;
+static int clampi(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
 }
 
 static void* velocity_scale_create_instance(const char *module_dir, const char *config_json) {
@@ -81,6 +62,8 @@ static void* velocity_scale_create_instance(const char *module_dir, const char *
     velocity_scale_instance_t *inst = calloc(1, sizeof(velocity_scale_instance_t));
     if (!inst) return NULL;
 
+    inst->input_min = 1;
+    inst->input_max = 127;
     inst->vel_min = 1;
     inst->vel_max = 127;
     inst->curve = 0;
@@ -103,21 +86,33 @@ static int velocity_scale_process_midi(void *instance,
     /* Only scale velocity on note-on messages with velocity > 0 */
     if (status == 0x90 && in_len >= 3 && in_msg[2] > 0) {
         int vel = in_msg[2];  /* 1-127 */
+
+        int in_lo = inst->input_min;
+        int in_hi = inst->input_max;
+        if (in_lo > in_hi) { int tmp = in_lo; in_lo = in_hi; in_hi = tmp; }
+
         int lo = inst->vel_min;
         int hi = inst->vel_max;
-
-        /* Ensure min <= max for the mapping */
         if (lo > hi) { int tmp = lo; lo = hi; hi = tmp; }
 
-        /* Stage order: MPC curve first, then linear min/max scale, then round.
-         * curve_stage and the scale are computed in floating point and rounded
-         * exactly once (round-half-up) so Curve=0 with the default 1..127 range
-         * is a true no-op (out == vel). */
-        double curved = curve_stage((double)vel, inst->curve);
-        double mapped = (double)lo + (curved - 1.0) * (double)(hi - lo) / 126.0;
-        int scaled = (int)floor(mapped + 0.5);  /* round-half-up */
-        if (scaled < 1) scaled = 1;
-        if (scaled > 127) scaled = 127;
+        /* Stage 1: Input range rescaling to normalized [0.0, 1.0] */
+        double n;
+        if (in_hi == in_lo) {
+            n = vel >= in_hi ? 1.0 : 0.0;  /* zero-width range acts as a threshold */
+        } else {
+            n = (double)(clampi(vel, in_lo, in_hi) - in_lo) / (double)(in_hi - in_lo);
+        }
+
+        /* Stage 2: MPC-style power curve, gamma = 2^(-curve/50).
+         * +100 -> 0.25 (soft hits louder), -100 -> 4.0 (needs harder hits).
+         * Endpoints 0 and 1 are fixed for any curve. */
+        double shaped = n;
+        if (inst->curve != 0) {
+            shaped = pow(n, pow(2.0, -inst->curve / 100.0 * 2.0));
+        }
+
+        /* Stage 3: Output min/max range mapping, rounded once (half-up) */
+        int scaled = (int)floor(lo + shaped * (hi - lo) + 0.5);
 
         out_msgs[0][0] = in_msg[0];
         out_msgs[0][1] = in_msg[1];
@@ -151,26 +146,22 @@ static void velocity_scale_set_param(void *instance, const char *key, const char
     velocity_scale_instance_t *inst = (velocity_scale_instance_t *)instance;
     if (!inst || !key || !val) return;
 
-    if (strcmp(key, "min") == 0) {
-        int v = atoi(val);
-        if (v < 1) v = 1;
-        if (v > 127) v = 127;
-        inst->vel_min = v;
+    if (strcmp(key, "input_min") == 0) {
+        inst->input_min = clampi(atoi(val), 1, 127);
+    }
+    else if (strcmp(key, "input_max") == 0) {
+        inst->input_max = clampi(atoi(val), 1, 127);
+    }
+    else if (strcmp(key, "min") == 0) {
+        inst->vel_min = clampi(atoi(val), 1, 127);
     }
     else if (strcmp(key, "max") == 0) {
-        int v = atoi(val);
-        if (v < 1) v = 1;
-        if (v > 127) v = 127;
-        inst->vel_max = v;
+        inst->vel_max = clampi(atoi(val), 1, 127);
     }
     else if (strcmp(key, "curve") == 0) {
-        int v = atoi(val);
-        if (v < -100) v = -100;
-        if (v > 100) v = 100;
-        inst->curve = v;
+        inst->curve = clampi(atoi(val), -100, 100);
     }
     else if (strcmp(key, "curve_preset") == 0) {
-        /* Named preset just sets the continuous Curve value. */
         for (int i = 0; i < NUM_CURVE_PRESETS; i++) {
             if (strcmp(val, CURVE_PRESETS[i].name) == 0) {
                 inst->curve = CURVE_PRESETS[i].value;
@@ -180,21 +171,12 @@ static void velocity_scale_set_param(void *instance, const char *key, const char
     }
     else if (strcmp(key, "state") == 0) {
         int v;
-        if (json_get_int(val, "min", &v)) {
-            if (v < 1) v = 1;
-            if (v > 127) v = 127;
-            inst->vel_min = v;
-        }
-        if (json_get_int(val, "max", &v)) {
-            if (v < 1) v = 1;
-            if (v > 127) v = 127;
-            inst->vel_max = v;
-        }
-        if (json_get_int(val, "curve", &v)) {
-            if (v < -100) v = -100;
-            if (v > 100) v = 100;
-            inst->curve = v;
-        }
+        /* States saved before input range existed lack these keys: reset to full range. */
+        inst->input_min = json_get_int(val, "input_min", &v) ? clampi(v, 1, 127) : 1;
+        inst->input_max = json_get_int(val, "input_max", &v) ? clampi(v, 1, 127) : 127;
+        if (json_get_int(val, "min", &v)) inst->vel_min = clampi(v, 1, 127);
+        if (json_get_int(val, "max", &v)) inst->vel_max = clampi(v, 1, 127);
+        if (json_get_int(val, "curve", &v)) inst->curve = clampi(v, -100, 100);
     }
 }
 
@@ -202,7 +184,13 @@ static int velocity_scale_get_param(void *instance, const char *key, char *buf, 
     velocity_scale_instance_t *inst = (velocity_scale_instance_t *)instance;
     if (!inst || !key || !buf || buf_len < 1) return -1;
 
-    if (strcmp(key, "min") == 0) {
+    if (strcmp(key, "input_min") == 0) {
+        return snprintf(buf, buf_len, "%d", inst->input_min);
+    }
+    else if (strcmp(key, "input_max") == 0) {
+        return snprintf(buf, buf_len, "%d", inst->input_max);
+    }
+    else if (strcmp(key, "min") == 0) {
         return snprintf(buf, buf_len, "%d", inst->vel_min);
     }
     else if (strcmp(key, "max") == 0) {
@@ -212,7 +200,6 @@ static int velocity_scale_get_param(void *instance, const char *key, char *buf, 
         return snprintf(buf, buf_len, "%d", inst->curve);
     }
     else if (strcmp(key, "curve_preset") == 0) {
-        /* Reflect the named preset matching the current Curve, else Linear. */
         const char *name = CURVE_PRESETS[0].name;
         for (int i = 0; i < NUM_CURVE_PRESETS; i++) {
             if (CURVE_PRESETS[i].value == inst->curve) {
@@ -223,11 +210,13 @@ static int velocity_scale_get_param(void *instance, const char *key, char *buf, 
         return snprintf(buf, buf_len, "%s", name);
     }
     else if (strcmp(key, "state") == 0) {
-        return snprintf(buf, buf_len, "{\"min\":%d,\"max\":%d,\"curve\":%d}",
-                        inst->vel_min, inst->vel_max, inst->curve);
+        return snprintf(buf, buf_len, "{\"input_min\":%d,\"input_max\":%d,\"min\":%d,\"max\":%d,\"curve\":%d}",
+                        inst->input_min, inst->input_max, inst->vel_min, inst->vel_max, inst->curve);
     }
     else if (strcmp(key, "chain_params") == 0) {
         const char *params = "["
+            "{\"key\":\"input_min\",\"name\":\"Input Min\",\"type\":\"int\",\"min\":1,\"max\":127,\"step\":1},"
+            "{\"key\":\"input_max\",\"name\":\"Input Max\",\"type\":\"int\",\"min\":1,\"max\":127,\"step\":1},"
             "{\"key\":\"min\",\"name\":\"Min Velocity\",\"type\":\"int\",\"min\":1,\"max\":127,\"step\":1},"
             "{\"key\":\"max\",\"name\":\"Max Velocity\",\"type\":\"int\",\"min\":1,\"max\":127,\"step\":1},"
             "{\"key\":\"curve\",\"name\":\"Curve\",\"type\":\"int\",\"min\":-100,\"max\":100,\"step\":1,\"default\":0},"
