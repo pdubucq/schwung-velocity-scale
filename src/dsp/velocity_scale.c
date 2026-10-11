@@ -30,7 +30,13 @@ static int json_get_int(const char *json, const char *key, int *out) {
     return 1;
 }
 
+/* Monitor readouts; 0 = no note seen since load/reset. */
+typedef struct { int last, lo, hi; } vel_stats_t;
+
 typedef struct {
+    int has_notes;
+    vel_stats_t mon_in;
+    vel_stats_t mon_out;
     int input_min; /* 1-127 */
     int input_max; /* 1-127 */
     int vel_min;   /* 1-127 */
@@ -54,6 +60,37 @@ static const curve_preset_t CURVE_PRESETS[] = {
 static int clampi(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
+
+static void stats_add(vel_stats_t *s, int v, int first) {
+    s->last = v;
+    if (first || v < s->lo) s->lo = v;
+    if (first || v > s->hi) s->hi = v;
+}
+
+/* The grid may send a trigger as the option index ("1") or the option text. */
+static int trigger_fired(const char *val, const char *fire_text) {
+    if (!val[0]) return 0;
+    return strcmp(val, "1") == 0 || strcmp(val, fire_text) == 0;
+}
+
+/* access:"read" makes the monitor values dotted readouts; access:"write" makes
+ * Reset a push button rather than a latching enum. */
+static const char CHAIN_PARAMS_JSON[] =
+    "["
+    "{\"key\":\"input_min\",\"name\":\"Input Min\",\"type\":\"int\",\"min\":1,\"max\":127,\"step\":1},"
+    "{\"key\":\"input_max\",\"name\":\"Input Max\",\"type\":\"int\",\"min\":1,\"max\":127,\"step\":1},"
+    "{\"key\":\"min\",\"name\":\"Min Velocity\",\"type\":\"int\",\"min\":1,\"max\":127,\"step\":1},"
+    "{\"key\":\"max\",\"name\":\"Max Velocity\",\"type\":\"int\",\"min\":1,\"max\":127,\"step\":1},"
+    "{\"key\":\"curve\",\"name\":\"Curve\",\"type\":\"int\",\"min\":-100,\"max\":100,\"step\":1,\"default\":0},"
+    "{\"key\":\"curve_preset\",\"name\":\"Curve Preset\",\"type\":\"enum\",\"options\":[\"Linear\",\"Soft\",\"Softer\",\"Hard\",\"Harder\"]},"
+    "{\"key\":\"mon_in_last\",\"name\":\"Input Last\",\"short_name\":\"In\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1,\"access\":\"read\"},"
+    "{\"key\":\"mon_in_lo\",\"name\":\"Input Lowest\",\"short_name\":\"In Lo\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1,\"access\":\"read\"},"
+    "{\"key\":\"mon_in_hi\",\"name\":\"Input Highest\",\"short_name\":\"In Hi\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1,\"access\":\"read\"},"
+    "{\"key\":\"mon_out_last\",\"name\":\"Output Last\",\"short_name\":\"Out\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1,\"access\":\"read\"},"
+    "{\"key\":\"mon_out_lo\",\"name\":\"Output Lowest\",\"short_name\":\"OutLo\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1,\"access\":\"read\"},"
+    "{\"key\":\"mon_out_hi\",\"name\":\"Output Highest\",\"short_name\":\"OutHi\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1,\"access\":\"read\"},"
+    "{\"key\":\"mon_reset\",\"name\":\"Reset Monitor\",\"short_name\":\"Reset\",\"type\":\"enum\",\"options\":[\"-\",\"Reset!\"],\"access\":\"write\"}"
+    "]";
 
 static void* velocity_scale_create_instance(const char *module_dir, const char *config_json) {
     (void)module_dir;
@@ -114,6 +151,10 @@ static int velocity_scale_process_midi(void *instance,
         /* Stage 3: Output min/max range mapping, rounded once (half-up) */
         int scaled = (int)floor(lo + shaped * (hi - lo) + 0.5);
 
+        stats_add(&inst->mon_in, vel, !inst->has_notes);
+        stats_add(&inst->mon_out, scaled, !inst->has_notes);
+        inst->has_notes = 1;
+
         out_msgs[0][0] = in_msg[0];
         out_msgs[0][1] = in_msg[1];
         out_msgs[0][2] = (uint8_t)scaled;
@@ -161,6 +202,13 @@ static void velocity_scale_set_param(void *instance, const char *key, const char
     else if (strcmp(key, "curve") == 0) {
         inst->curve = clampi(atoi(val), -100, 100);
     }
+    else if (strcmp(key, "mon_reset") == 0) {
+        if (trigger_fired(val, "Reset!")) {
+            inst->has_notes = 0;
+            memset(&inst->mon_in, 0, sizeof(inst->mon_in));
+            memset(&inst->mon_out, 0, sizeof(inst->mon_out));
+        }
+    }
     else if (strcmp(key, "curve_preset") == 0) {
         for (int i = 0; i < NUM_CURVE_PRESETS; i++) {
             if (strcmp(val, CURVE_PRESETS[i].name) == 0) {
@@ -199,6 +247,13 @@ static int velocity_scale_get_param(void *instance, const char *key, char *buf, 
     else if (strcmp(key, "curve") == 0) {
         return snprintf(buf, buf_len, "%d", inst->curve);
     }
+    else if (strcmp(key, "mon_in_last") == 0)  return snprintf(buf, buf_len, "%d", inst->mon_in.last);
+    else if (strcmp(key, "mon_in_lo") == 0)    return snprintf(buf, buf_len, "%d", inst->mon_in.lo);
+    else if (strcmp(key, "mon_in_hi") == 0)    return snprintf(buf, buf_len, "%d", inst->mon_in.hi);
+    else if (strcmp(key, "mon_out_last") == 0) return snprintf(buf, buf_len, "%d", inst->mon_out.last);
+    else if (strcmp(key, "mon_out_lo") == 0)   return snprintf(buf, buf_len, "%d", inst->mon_out.lo);
+    else if (strcmp(key, "mon_out_hi") == 0)   return snprintf(buf, buf_len, "%d", inst->mon_out.hi);
+    else if (strcmp(key, "mon_reset") == 0)    return snprintf(buf, buf_len, "0");
     else if (strcmp(key, "curve_preset") == 0) {
         const char *name = CURVE_PRESETS[0].name;
         for (int i = 0; i < NUM_CURVE_PRESETS; i++) {
@@ -214,15 +269,10 @@ static int velocity_scale_get_param(void *instance, const char *key, char *buf, 
                         inst->input_min, inst->input_max, inst->vel_min, inst->vel_max, inst->curve);
     }
     else if (strcmp(key, "chain_params") == 0) {
-        const char *params = "["
-            "{\"key\":\"input_min\",\"name\":\"Input Min\",\"type\":\"int\",\"min\":1,\"max\":127,\"step\":1},"
-            "{\"key\":\"input_max\",\"name\":\"Input Max\",\"type\":\"int\",\"min\":1,\"max\":127,\"step\":1},"
-            "{\"key\":\"min\",\"name\":\"Min Velocity\",\"type\":\"int\",\"min\":1,\"max\":127,\"step\":1},"
-            "{\"key\":\"max\",\"name\":\"Max Velocity\",\"type\":\"int\",\"min\":1,\"max\":127,\"step\":1},"
-            "{\"key\":\"curve\",\"name\":\"Curve\",\"type\":\"int\",\"min\":-100,\"max\":100,\"step\":1,\"default\":0},"
-            "{\"key\":\"curve_preset\",\"name\":\"Curve Preset\",\"type\":\"enum\",\"options\":[\"Linear\",\"Soft\",\"Softer\",\"Hard\",\"Harder\"]}"
-        "]";
-        return snprintf(buf, buf_len, "%s", params);
+        int n = (int)sizeof(CHAIN_PARAMS_JSON) - 1;
+        if (n >= buf_len) return -1;  /* truncated JSON is worse than the module.json fallback */
+        memcpy(buf, CHAIN_PARAMS_JSON, (size_t)n + 1);
+        return n;
     }
 
     return -1;
